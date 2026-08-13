@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from enum import Enum
 from hashlib import sha256
 from html import unescape
 from html.parser import HTMLParser
+import json
+import os
+from pathlib import Path
+from typing import Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
 TARGET_HEADING = "Записаться на экскурсию"
 TARGET_END_MARKER = "Контактная информация"
+PAGE_URL = "https://mus-col.com/contacts/tours.php"
 
 
 def normalize_text(value: str) -> str:
@@ -35,6 +44,103 @@ class PageResult:
     kind: PageKind
     text: str
     fingerprint: str
+
+
+class MonitorError(RuntimeError):
+    pass
+
+
+@dataclass
+class DailyState:
+    day: date
+    alert_sent: bool = False
+    daily_report_sent: bool = False
+    unexpected_hashes: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.unexpected_hashes is None:
+            self.unexpected_hashes = set()
+
+    @classmethod
+    def for_date(cls, path: Path, day: date) -> DailyState:
+        if not path.exists():
+            return cls(day=day)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            stored_day = date.fromisoformat(payload["date"])
+            if stored_day != day:
+                return cls(day=day)
+            return cls(
+                day=stored_day,
+                alert_sent=bool(payload.get("alert_sent", False)),
+                daily_report_sent=bool(payload.get("daily_report_sent", False)),
+                unexpected_hashes=set(payload.get("unexpected_hashes", [])),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise MonitorError("Monitor state is invalid") from error
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        payload = {
+            "date": self.day.isoformat(),
+            "alert_sent": self.alert_sent,
+            "daily_report_sent": self.daily_report_sent,
+            "unexpected_hashes": sorted(self.unexpected_hashes or set()),
+        }
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+
+
+class TelegramClient:
+    def __init__(
+        self,
+        token: str,
+        chat_id: str,
+        opener: Callable[..., object] = urlopen,
+        timeout: float = 15.0,
+    ) -> None:
+        self._token = token
+        self._chat_id = chat_id
+        self._opener = opener
+        self._timeout = timeout
+
+    def send(self, text: str) -> None:
+        data = urlencode({"chat_id": self._chat_id, "text": text}).encode("utf-8")
+        request = Request(
+            f"https://api.telegram.org/bot{self._token}/sendMessage",
+            data=data,
+            method="POST",
+        )
+        try:
+            with self._opener(request, timeout=self._timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MonitorError("Telegram delivery failed") from error
+        if payload.get("ok") is not True:
+            raise MonitorError("Telegram rejected the message")
+
+
+def format_availability(result: PageResult) -> str:
+    return (
+        "🎟 Появились экскурсии в музее «Собрание»!\n\n"
+        f"{result.text}\n\n"
+        f"Записаться: {PAGE_URL}"
+    )
+
+
+def format_unexpected(result: PageResult) -> str:
+    excerpt = result.text[:800]
+    return (
+        "⚠️ Не удалось распознать формат страницы экскурсий. "
+        "Мониторинг продолжится по расписанию.\n\n"
+        f"Фрагмент: {excerpt}\n\n"
+        f"Проверить страницу: {PAGE_URL}"
+    )
 
 
 @dataclass(frozen=True)
