@@ -31,6 +31,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 REPOSITORY_ROOT = Path(__file__).parents[1]
 WORKFLOW_MONITOR = REPOSITORY_ROOT / ".github/workflows/museum-tours-monitor.yml"
 WORKFLOW_REPORT = REPOSITORY_ROOT / ".github/workflows/museum-tours-report.yml"
+README = REPOSITORY_ROOT / "README.md"
 
 
 def load_fixture(name: str) -> str:
@@ -528,6 +529,24 @@ class WorkflowContractTests(unittest.TestCase):
 			self.assertIn("git add state/status.json", workflow)
 			self.assertIn("git pull --rebase origin main", workflow)
 			self.assertIn("git push origin HEAD:main", workflow)
+
+
+class DocumentationTests(unittest.TestCase):
+	def test_readme_documents_setup_schedule_alerts_and_shutdown(self):
+		readme = README.read_text(encoding="utf-8")
+		for required in (
+			"TELEGRAM_BOT_TOKEN",
+			"TELEGRAM_CHAT_ID",
+			"Europe/Moscow",
+			"20%",
+			"Museum Tours Monitor",
+			"Museum Tours Daily Report",
+			"Disable workflow",
+			"https://mus-col.com/contacts/tours.php",
+			"UNEXPECTED_FORMAT",
+		):
+			with self.subTest(required=required):
+				self.assertIn(required, readme)
 
 if __name__ == "__main__":
 	unittest.main()
