@@ -61,7 +61,126 @@ class PageClassificationTests(unittest.TestCase):
 			"<h1>Записаться на экскурсию</h1><p>Технические работы</p>"
 		)
 		self.assertEqual(PageKind.UNEXPECTED_FORMAT, result.kind)
-		self.assertTrue(result.fingerprint)
+		self.assertEqual(
+			"Записаться на экскурсию Технические работы",
+			result.text,
+		)
+
+	def test_bodyless_unknown_pages_have_distinct_fingerprints(self):
+		first = classify_tour_page(
+			"<h1>Записаться на экскурсию</h1><p>Технические работы</p>"
+		)
+		second = classify_tour_page(
+			"<h1>Записаться на экскурсию</h1><p>Форма обновляется</p>"
+		)
+
+		self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+	def test_text_inside_form_is_not_a_registration_control(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<form><p>Запись временно недоступна</p></form>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_target_heading_link_is_not_a_registration_control(self):
+		source = """
+		<html><body>
+		<a href="/contacts/tours.php">Записаться на экскурсию</a>
+		<p>Технические работы</p>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_input_value_is_a_registration_control_for_a_tour(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p><p>Обзорная экскурсия</p>
+		<input type="submit" value="Записаться">
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.TOURS_AVAILABLE, classify_tour_page(source).kind)
+
+	def test_disabled_button_is_not_available_registration(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p><button disabled>Записаться</button>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_disabled_input_is_not_available_registration(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p>
+		<input type="submit" disabled value="Записаться">
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_link_without_href_is_not_available_registration(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p><a>Записаться</a>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_cancelled_tour_is_not_available(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>Экскурсия 15 августа, 14:00 отменена</p>
+		<button>Записаться</button>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
+	def test_tour_title_containing_net_letters_is_available(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p><p>Кабинет редкостей</p>
+		<a href="/booking/42">Записаться</a>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.TOURS_AVAILABLE, classify_tour_page(source).kind)
+
+	def test_available_tour_wins_over_separate_cancelled_tour(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>15 августа, 14:00</p><p>Обзорная экскурсия</p>
+		<a href="/booking/42">Записаться</a>
+		<p>16 августа, 15:00 — экскурсия отменена</p>
+		<button disabled>Записаться</button>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.TOURS_AVAILABLE, classify_tour_page(source).kind)
 
 	def test_generic_link_inside_target_block_is_not_tour_availability(self):
 		source = """
@@ -262,6 +381,21 @@ class CheckFlowTests(unittest.TestCase):
 		)
 		self.assertEqual(2, len(self.telegram.messages))
 
+	def test_changed_bodyless_unknown_content_alerts_again(self):
+		first = classify_tour_page(
+			"<h1>Записаться на экскурсию</h1><p>Технические работы</p>"
+		)
+		second = classify_tour_page(
+			"<h1>Записаться на экскурсию</h1><p>Форма обновляется</p>"
+		)
+
+		run_check(_FakePage(first), self.telegram, self.state_path, self.now)
+		run_check(_FakePage(second), self.telegram, self.state_path, self.now)
+
+		self.assertEqual(2, len(self.telegram.messages))
+		self.assertIn("Технические работы", self.telegram.messages[0])
+		self.assertIn("Форма обновляется", self.telegram.messages[1])
+
 	def test_available_tour_after_error_still_alerts(self):
 		run_check(_FakePage(self.unexpected), self.telegram, self.state_path, self.now)
 
@@ -273,21 +407,32 @@ class CheckFlowTests(unittest.TestCase):
 		self.assertIn("Появились экскурсии", self.telegram.messages[-1])
 
 	def test_network_error_does_not_mutate_state(self):
-		self.assertEqual(
-			2,
-			run_check(
+		output = io.StringIO()
+		with redirect_stdout(output):
+			code = run_check(
 				_FakePage(error=MonitorError("Museum page request failed")),
 				self.telegram,
 				self.state_path,
 				self.now,
-			),
-		)
+			)
+
+		self.assertEqual(2, code)
+		self.assertIn("Museum page request failed", output.getvalue())
 		self.assertFalse(self.state_path.exists())
 
 	def test_page_client_classifies_http_response(self):
 		def opener(request, timeout):
 			self.assertEqual("https://mus-col.com/contacts/tours.php", request.full_url)
 			return _FakeResponse(load_fixture("no_tours.html").encode("utf-8"))
+
+		result = PageClient(opener=opener).fetch_and_classify()
+
+		self.assertEqual(PageKind.NO_TOURS, result.kind)
+
+	def test_page_client_tolerates_broken_trailing_utf8_byte(self):
+		def opener(request, timeout):
+			payload = load_fixture("no_tours.html").encode("utf-8") + b"\xd1"
+			return _FakeResponse(payload)
 
 		result = PageClient(opener=opener).fetch_and_classify()
 
@@ -558,6 +703,15 @@ class WorkflowContractTests(unittest.TestCase):
 			self.assertIn("git add state/status.json", workflow)
 			self.assertIn("git pull --rebase origin main", workflow)
 			self.assertIn("git push origin HEAD:main", workflow)
+
+	def test_queued_jobs_checkout_current_main_before_reading_state(self):
+		for path in (WORKFLOW_MONITOR, WORKFLOW_REPORT):
+			workflow = path.read_text(encoding="utf-8")
+			checkout = workflow.index("uses: actions/checkout@v4")
+			current_main = workflow.index("ref: main", checkout)
+			monitor_call = workflow.index("python3 src/monitor.py", current_main)
+			self.assertLess(checkout, current_main)
+			self.assertLess(current_main, monitor_call)
 
 
 class DocumentationTests(unittest.TestCase):

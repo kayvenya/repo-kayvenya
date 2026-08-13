@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
 from typing import Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -21,10 +22,25 @@ TARGET_HEADING = "Записаться на экскурсию"
 TARGET_END_MARKER = "Контактная информация"
 PAGE_URL = "https://mus-col.com/contacts/tours.php"
 REGISTRATION_PREFIXES = ("запис", "зарегистр", "заброниров")
+TOUR_DATE_OR_TIME = re.compile(
+    r"(?:\b\d{1,2}[:.]\d{2}\b|"
+    r"\b\d{1,2}\s+(?:январ|феврал|март|апрел|ма[яй]|июн|июл|август|"
+    r"сентябр|октябр|ноябр|декабр))",
+    re.IGNORECASE,
+)
+UNAVAILABLE_PATTERN = re.compile(
+    r"\b(?:нет|недоступ\w*|техническ\w*|отмен\w*|приостанов\w*)\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_text(value: str) -> str:
     return " ".join(unescape(value).split())
+
+
+BOOKING_SCHEDULE_TEXT = normalize_text(
+    "Запись на новые экскурсии открывается ежедневно по будням в 13:00."
+)
 
 
 NO_TOURS_TEXT = normalize_text(
@@ -142,7 +158,7 @@ class PageClient:
         )
         try:
             with self._opener(request, timeout=self._timeout) as response:
-                source = response.read().decode("utf-8")
+                source = response.read().decode("utf-8", errors="replace")
         except (HTTPError, URLError, OSError, UnicodeDecodeError) as error:
             raise MonitorError("Museum page request failed") from error
         return classify_tour_page(source)
@@ -306,7 +322,8 @@ def run_check(
 ) -> int:
     try:
         result = page_client.fetch_and_classify()
-    except MonitorError:
+    except MonitorError as error:
+        print(error)
         return 2
 
     state = DailyState.for_date(state_path, _moscow_day(now_utc))
@@ -426,39 +443,117 @@ class _TextToken:
 
 class _VisibleTextParser(HTMLParser):
     _IGNORED_TAGS = {"script", "style", "template"}
-    _ACTIONABLE_TAGS = {"a", "button", "form", "input", "select"}
+    _ACTIONABLE_CONTAINERS = {"a", "button"}
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.tokens: list[_TextToken] = []
+        self._document_tokens: list[_TextToken] = []
+        self._body_tokens: list[_TextToken] = []
         self._ignored_depth = 0
-        self._actionable_depth = 0
+        self._actionable_stack: list[bool] = []
+        self._disabled_fieldsets: list[bool] = []
         self._body_depth = 0
+        self._saw_body = False
+
+    @property
+    def tokens(self) -> list[_TextToken]:
+        return self._body_tokens if self._saw_body else self._document_tokens
+
+    def _record(self, text: str, actionable: bool) -> None:
+        token = _TextToken(text, actionable)
+        self._document_tokens.append(token)
+        if self._body_depth:
+            self._body_tokens.append(token)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
+        attributes = {name.casefold(): value for name, value in attrs}
         if tag == "body":
             self._body_depth += 1
+            self._saw_body = True
         if tag in self._IGNORED_TAGS:
             self._ignored_depth += 1
-        if tag in self._ACTIONABLE_TAGS:
-            self._actionable_depth += 1
+        if tag == "fieldset":
+            self._disabled_fieldsets.append("disabled" in attributes)
+        if tag in self._ACTIONABLE_CONTAINERS:
+            disabled = (
+                "disabled" in attributes
+                or (attributes.get("aria-disabled") or "").casefold() == "true"
+                or any(self._disabled_fieldsets)
+            )
+            if tag == "a":
+                href = normalize_text(attributes.get("href") or "")
+                disabled = (
+                    disabled
+                    or not href
+                    or href.startswith("#")
+                    or href.casefold().startswith("javascript:")
+                )
+            self._actionable_stack.append(not disabled)
+        if tag == "input" and not self._ignored_depth:
+            input_type = (attributes.get("type") or "text").casefold()
+            disabled = (
+                "disabled" in attributes
+                or (attributes.get("aria-disabled") or "").casefold() == "true"
+                or any(self._disabled_fieldsets)
+            )
+            if input_type in {"submit", "button"} and not disabled:
+                label = normalize_text(
+                    attributes.get("value") or attributes.get("aria-label") or ""
+                )
+                if label:
+                    self._record(label, actionable=True)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
-        if tag in self._ACTIONABLE_TAGS and self._actionable_depth:
-            self._actionable_depth -= 1
+        if tag in self._ACTIONABLE_CONTAINERS and self._actionable_stack:
+            self._actionable_stack.pop()
+        if tag == "fieldset" and self._disabled_fieldsets:
+            self._disabled_fieldsets.pop()
         if tag in self._IGNORED_TAGS and self._ignored_depth:
             self._ignored_depth -= 1
         if tag == "body" and self._body_depth:
             self._body_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if self._ignored_depth or not self._body_depth:
+        if self._ignored_depth:
             return
         text = normalize_text(data)
         if text:
-            self.tokens.append(_TextToken(text, self._actionable_depth > 0))
+            self._record(text, any(self._actionable_stack))
+
+
+def _is_tour_detail(token: _TextToken) -> bool:
+    if token.actionable:
+        return False
+    return (
+        token.text != BOOKING_SCHEDULE_TEXT
+        and bool(TOUR_DATE_OR_TIME.search(token.text))
+    )
+
+
+def _has_available_tour(tokens: Sequence[_TextToken]) -> bool:
+    detail_indexes = [
+        index for index, token in enumerate(tokens) if _is_tour_detail(token)
+    ]
+    for position, start in enumerate(detail_indexes):
+        end = (
+            detail_indexes[position + 1]
+            if position + 1 < len(detail_indexes)
+            else len(tokens)
+        )
+        candidate = tokens[start:end]
+        has_registration_control = any(
+            token.actionable
+            and token.text.casefold().startswith(REGISTRATION_PREFIXES)
+            for token in candidate
+        )
+        has_unavailable_marker = any(
+            UNAVAILABLE_PATTERN.search(token.text) for token in candidate
+        )
+        if has_registration_control and not has_unavailable_marker:
+            return True
+    return False
 
 
 def _fingerprint(text: str) -> str:
@@ -495,14 +590,9 @@ def classify_tour_page(source: str) -> PageResult:
 
     block = parser.tokens[start:end]
     block_text = normalize_text(" ".join(token.text for token in block))
-    has_registration_control = any(
-        token.actionable
-        and token.text.casefold().startswith(REGISTRATION_PREFIXES)
-        for token in block
-    )
     if block_text == NO_TOURS_TEXT:
         kind = PageKind.NO_TOURS
-    elif has_registration_control and block_text != TARGET_HEADING:
+    elif _has_available_tour(block[1:]):
         kind = PageKind.TOURS_AVAILABLE
     else:
         kind = PageKind.UNEXPECTED_FORMAT
