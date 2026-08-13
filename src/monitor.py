@@ -415,10 +415,6 @@ def main(
     )
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 @dataclass(frozen=True)
 class _TextToken:
     text: str
@@ -504,3 +500,7 @@ def classify_tour_page(source: str) -> PageResult:
         kind = PageKind.UNEXPECTED_FORMAT
 
     return PageResult(kind, block_text[:800], _fingerprint(block_text))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -548,5 +548,14 @@ class DocumentationTests(unittest.TestCase):
 			with self.subTest(required=required):
 				self.assertIn(required, readme)
 
+
+class SourceLayoutTests(unittest.TestCase):
+	def test_script_entrypoint_is_after_all_runtime_definitions(self):
+		source = (REPOSITORY_ROOT / "src/monitor.py").read_text(encoding="utf-8")
+		self.assertLess(
+			source.index("def classify_tour_page"),
+			source.index('if __name__ == "__main__"'),
+		)
+
 if __name__ == "__main__":
 	unittest.main()
