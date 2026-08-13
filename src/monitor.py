@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 from hashlib import sha256
 from html import unescape
@@ -13,6 +14,7 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 
 TARGET_HEADING = "Записаться на экскурсию"
@@ -125,6 +127,24 @@ class TelegramClient:
             raise MonitorError("Telegram rejected the message")
 
 
+class PageClient:
+    def __init__(self, opener: Callable[..., object] = urlopen, timeout: float = 15.0):
+        self._opener = opener
+        self._timeout = timeout
+
+    def fetch_and_classify(self) -> PageResult:
+        request = Request(
+            PAGE_URL,
+            headers={"User-Agent": "museum-tours-monitor/1.0 (+personal notifier)"},
+        )
+        try:
+            with self._opener(request, timeout=self._timeout) as response:
+                source = response.read().decode("utf-8")
+        except (HTTPError, URLError, OSError, UnicodeDecodeError) as error:
+            raise MonitorError("Museum page request failed") from error
+        return classify_tour_page(source)
+
+
 def format_availability(result: PageResult) -> str:
     return (
         "🎟 Появились экскурсии в музее «Собрание»!\n\n"
@@ -141,6 +161,84 @@ def format_unexpected(result: PageResult) -> str:
         f"Фрагмент: {excerpt}\n\n"
         f"Проверить страницу: {PAGE_URL}"
     )
+
+
+def _moscow_day(now_utc: datetime) -> date:
+    if now_utc.tzinfo is None:
+        raise MonitorError("Current time must include a time zone")
+    return now_utc.astimezone(ZoneInfo("Europe/Moscow")).date()
+
+
+def run_check(
+    page_client: object,
+    telegram: object,
+    state_path: Path,
+    now_utc: datetime,
+) -> int:
+    try:
+        result = page_client.fetch_and_classify()
+    except MonitorError:
+        return 2
+
+    state = DailyState.for_date(state_path, _moscow_day(now_utc))
+    if result.kind is PageKind.NO_TOURS:
+        return 0
+
+    if result.kind is PageKind.TOURS_AVAILABLE:
+        if state.alert_sent:
+            return 0
+        try:
+            telegram.send(format_availability(result))
+        except MonitorError:
+            return 3
+        state.alert_sent = True
+        state.save(state_path)
+        return 0
+
+    if result.fingerprint not in (state.unexpected_hashes or set()):
+        try:
+            telegram.send(format_unexpected(result))
+        except MonitorError:
+            return 3
+        state.unexpected_hashes.add(result.fingerprint)
+        state.save(state_path)
+    return 2
+
+
+def main(
+    argv: list[str] | None = None,
+    environ: dict[str, str] | os._Environ[str] = os.environ,
+    opener: Callable[..., object] | None = urlopen,
+) -> int:
+    parser = argparse.ArgumentParser(description="Monitor museum tour availability")
+    parser.add_argument("command", choices=("check", "test-notification"))
+    arguments = parser.parse_args(argv)
+
+    token = environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id or opener is None:
+        print("Missing required Telegram configuration")
+        return 3
+
+    telegram = TelegramClient(token, chat_id, opener=opener)
+    if arguments.command == "test-notification":
+        try:
+            telegram.send("✅ Тест: монитор экскурсий может отправлять сообщения.")
+        except MonitorError as error:
+            print(error)
+            return 3
+        return 0
+
+    return run_check(
+        PageClient(opener=opener),
+        telegram,
+        Path(environ.get("MONITOR_STATE_PATH", "state/status.json")),
+        datetime.now(timezone.utc),
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 @dataclass(frozen=True)
