@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from src.monitor import (
 	DailyState,
@@ -311,6 +311,31 @@ class TelegramTests(unittest.TestCase):
 			client.send("test")
 
 		self.assertNotIn("secret-token", str(raised.exception))
+
+	def test_telegram_http_error_reports_safe_api_description(self):
+		def failing_opener(request, timeout):
+			raise HTTPError(
+				request.full_url,
+				400,
+				"Bad Request",
+				{},
+				io.BytesIO(
+					b'{"ok":false,"error_code":400,'
+					b'"description":"Bad Request: chat not found"}'
+				),
+			)
+
+		client = TelegramClient("secret-token", "123", opener=failing_opener)
+		with self.assertRaises(MonitorError) as raised:
+			client.send("test")
+
+		message = str(raised.exception)
+		self.assertEqual(
+			"Telegram API HTTP 400: Bad Request: chat not found",
+			message,
+		)
+		self.assertNotIn("secret-token", message)
+		self.assertNotIn("123", message)
 
 
 class _FakePage:

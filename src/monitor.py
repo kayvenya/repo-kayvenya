@@ -140,7 +140,25 @@ class TelegramClient:
         try:
             with self._opener(request, timeout=self._timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        except HTTPError as error:
+            description = ""
+            try:
+                error_payload = json.loads(
+                    error.read().decode("utf-8", errors="replace")
+                )
+                raw_description = error_payload.get("description")
+                if isinstance(raw_description, str):
+                    description = normalize_text(raw_description)
+                    description = description.replace(self._token, "<token>")
+                    description = description.replace(self._chat_id, "<chat_id>")
+                    description = description[:200]
+            except (OSError, json.JSONDecodeError):
+                pass
+            message = f"Telegram API HTTP {error.code}"
+            if description:
+                message = f"{message}: {description}"
+            raise MonitorError(message) from error
+        except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise MonitorError("Telegram delivery failed") from error
         if payload.get("ok") is not True:
             raise MonitorError("Telegram rejected the message")
