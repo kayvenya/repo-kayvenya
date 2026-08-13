@@ -1,0 +1,80 @@
+name: Museum Tours Daily Report
+
+on:
+  schedule:
+    - cron: '40,50 11 * * *'
+    - cron: '5 12 * * *'
+  workflow_dispatch:
+    inputs:
+      final_attempt:
+        description: Count missing or incomplete checks as errors immediately
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: museum-tours-state
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare daily report
+        id: report
+        env:
+          FINAL_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && inputs.final_attempt || github.event.schedule == '5 12 * * *' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          set +e
+          python3 src/monitor.py report --final-attempt="$FINAL_ATTEMPT"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Persist report state
+        if: ${{ always() && steps.report.outputs.code == '0' }}
+        shell: bash
+        run: |
+          git add state/status.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'museum-tours-monitor[bot]'
+          git config user.email 'museum-tours-monitor[bot]@users.noreply.github.com'
+          git commit -m 'chore: update museum monitor state'
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Propagate report result
+        if: ${{ always() }}
+        env:
+          RESULT_CODE: ${{ steps.report.outputs.code }}
+        shell: bash
+        run: |
+          if [ "$RESULT_CODE" = '4' ]; then
+            exit 0
+          fi
+          if [ -z "$RESULT_CODE" ]; then
+            exit 3
+          fi
+          exit "$RESULT_CODE"

@@ -1,0 +1,78 @@
+name: Museum Tours Monitor
+
+on:
+  schedule:
+    - cron: '50,55 9 * * *'
+    - cron: '*/5 10 * * *'
+    - cron: '0-30/5 11 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Action to run
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - test-notification
+
+permissions:
+  contents: write
+
+concurrency:
+  group: museum-tours-state
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check museum page
+        id: monitor
+        env:
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'check' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          set +e
+          python3 src/monitor.py "$MODE"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Persist notification state
+        if: ${{ always() && steps.monitor.outputs.code != '' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'check') }}
+        shell: bash
+        run: |
+          git add state/status.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'museum-tours-monitor[bot]'
+          git config user.email 'museum-tours-monitor[bot]@users.noreply.github.com'
+          git commit -m 'chore: update museum monitor state'
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Propagate monitor result
+        if: ${{ always() }}
+        env:
+          RESULT_CODE: ${{ steps.monitor.outputs.code }}
+        shell: bash
+        run: |
+          if [ -z "$RESULT_CODE" ]; then
+            exit 3
+          fi
+          exit "$RESULT_CODE"

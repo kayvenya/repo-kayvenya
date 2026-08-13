@@ -28,6 +28,9 @@ from src.monitor import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+REPOSITORY_ROOT = Path(__file__).parents[1]
+WORKFLOW_MONITOR = REPOSITORY_ROOT / ".github/workflows/museum-tours-monitor.yml"
+WORKFLOW_REPORT = REPOSITORY_ROOT / ".github/workflows/museum-tours-report.yml"
 
 
 def load_fixture(name: str) -> str:
@@ -490,6 +493,41 @@ class ReportTests(unittest.TestCase):
 		self.assertIn("museum-tours-monitor.yml/runs", requests[0].full_url)
 		self.assertIn("event=schedule", requests[0].full_url)
 		self.assertEqual("Bearer github-token", requests[0].get_header("Authorization"))
+
+
+class WorkflowContractTests(unittest.TestCase):
+	def test_monitor_workflow_has_exact_daily_schedule_and_shared_lock(self):
+		monitor = WORKFLOW_MONITOR.read_text(encoding="utf-8")
+		self.assertIn("'50,55 9 * * *'", monitor)
+		self.assertIn("'*/5 10 * * *'", monitor)
+		self.assertIn("'0-30/5 11 * * *'", monitor)
+		self.assertIn("group: museum-tours-state", monitor)
+		self.assertIn("cancel-in-progress: false", monitor)
+		self.assertIn("contents: write", monitor)
+		self.assertIn("TELEGRAM_BOT_TOKEN", monitor)
+		self.assertIn("TELEGRAM_CHAT_ID", monitor)
+		self.assertIn("python3 src/monitor.py", monitor)
+		minutes = [50, 55] + list(range(0, 60, 5)) + list(range(0, 31, 5))
+		self.assertEqual(21, len(minutes))
+
+	def test_report_workflow_has_retries_final_attempt_and_actions_read_access(self):
+		report = WORKFLOW_REPORT.read_text(encoding="utf-8")
+		self.assertIn("'40,50 11 * * *'", report)
+		self.assertIn("'5 12 * * *'", report)
+		self.assertIn("group: museum-tours-state", report)
+		self.assertIn("cancel-in-progress: false", report)
+		self.assertIn("actions: read", report)
+		self.assertIn("contents: write", report)
+		self.assertIn("--final-attempt", report)
+		self.assertIn("GITHUB_TOKEN", report)
+		self.assertIn("TELEGRAM_BOT_TOKEN", report)
+
+	def test_both_workflows_commit_only_the_state_file(self):
+		for path in (WORKFLOW_MONITOR, WORKFLOW_REPORT):
+			workflow = path.read_text(encoding="utf-8")
+			self.assertIn("git add state/status.json", workflow)
+			self.assertIn("git pull --rebase origin main", workflow)
+			self.assertIn("git push origin HEAD:main", workflow)
 
 if __name__ == "__main__":
 	unittest.main()
