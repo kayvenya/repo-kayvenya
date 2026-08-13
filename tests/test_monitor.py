@@ -90,6 +90,24 @@ class StateTests(unittest.TestCase):
 		self.assertFalse(state.daily_report_sent)
 		self.assertEqual(set(), state.unexpected_hashes)
 
+	def test_empty_initial_date_starts_fresh_state(self):
+		self.state_path.write_text(
+			json.dumps(
+				{
+					"date": "",
+					"alert_sent": False,
+					"daily_report_sent": False,
+					"unexpected_hashes": [],
+				}
+			),
+			encoding="utf-8",
+		)
+
+		state = DailyState.for_date(self.state_path, date(2026, 8, 14))
+
+		self.assertEqual(date(2026, 8, 14), state.day)
+		self.assertFalse(state.alert_sent)
+
 	def test_state_round_trip_is_stable_and_contains_no_credentials(self):
 		state = DailyState(
 			day=date(2026, 8, 14),

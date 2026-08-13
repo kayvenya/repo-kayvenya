@@ -69,6 +69,8 @@ class DailyState:
             return cls(day=day)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("date") == "":
+                return cls(day=day)
             stored_day = date.fromisoformat(payload["date"])
             if stored_day != day:
                 return cls(day=day)
