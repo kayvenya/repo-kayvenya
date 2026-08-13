@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 TARGET_HEADING = "Записаться на экскурсию"
 TARGET_END_MARKER = "Контактная информация"
 PAGE_URL = "https://mus-col.com/contacts/tours.php"
+REGISTRATION_PREFIXES = ("запис", "зарегистр", "заброниров")
 
 
 def normalize_text(value: str) -> str:
@@ -494,9 +495,14 @@ def classify_tour_page(source: str) -> PageResult:
 
     block = parser.tokens[start:end]
     block_text = normalize_text(" ".join(token.text for token in block))
+    has_registration_control = any(
+        token.actionable
+        and token.text.casefold().startswith(REGISTRATION_PREFIXES)
+        for token in block
+    )
     if block_text == NO_TOURS_TEXT:
         kind = PageKind.NO_TOURS
-    elif any(token.actionable for token in block) and block_text != TARGET_HEADING:
+    elif has_registration_control and block_text != TARGET_HEADING:
         kind = PageKind.TOURS_AVAILABLE
     else:
         kind = PageKind.UNEXPECTED_FORMAT

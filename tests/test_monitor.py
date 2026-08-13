@@ -63,6 +63,17 @@ class PageClassificationTests(unittest.TestCase):
 		self.assertEqual(PageKind.UNEXPECTED_FORMAT, result.kind)
 		self.assertTrue(result.fingerprint)
 
+	def test_generic_link_inside_target_block_is_not_tour_availability(self):
+		source = """
+		<html><body>
+		<h1>Записаться на экскурсию</h1>
+		<p>Технические работы</p><a href="/news">Подробнее</a>
+		<a href="/contacts/">Контактная информация</a>
+		</body></html>
+		"""
+
+		self.assertEqual(PageKind.UNEXPECTED_FORMAT, classify_tour_page(source).kind)
+
 
 class StateTests(unittest.TestCase):
 	def setUp(self):
