@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 from html import unescape
@@ -10,7 +10,7 @@ from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -145,6 +145,89 @@ class PageClient:
         return classify_tour_page(source)
 
 
+@dataclass(frozen=True)
+class WorkflowRun:
+    run_id: int
+    status: str
+    conclusion: str | None
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    successes: int
+    errors: int
+    terminal_runs: int
+    observed_runs: int
+
+    @property
+    def error_ratio(self) -> float:
+        return self.errors / 21
+
+
+class GitHubClient:
+    def __init__(
+        self,
+        token: str,
+        repository: str,
+        opener: Callable[..., object] = urlopen,
+        timeout: float = 15.0,
+    ) -> None:
+        self._token = token
+        self._repository = repository
+        self._opener = opener
+        self._timeout = timeout
+
+    def list_monitor_runs(self, day: date, now_utc: datetime) -> list[WorkflowRun]:
+        moscow = ZoneInfo("Europe/Moscow")
+        start = datetime.combine(day, time(12, 40), moscow).astimezone(timezone.utc)
+        end = now_utc.astimezone(timezone.utc) + timedelta(minutes=1)
+        query = urlencode(
+            {
+                "event": "schedule",
+                "created": f"{start.isoformat()}..{end.isoformat()}",
+                "per_page": "100",
+            }
+        )
+        request = Request(
+            "https://api.github.com/repos/"
+            f"{self._repository}/actions/workflows/museum-tours-monitor.yml/runs?{query}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "museum-tours-monitor/1.0",
+            },
+        )
+        try:
+            with self._opener(request, timeout=self._timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            raw_runs = payload["workflow_runs"]
+            if not isinstance(raw_runs, list):
+                raise TypeError("workflow_runs must be a list")
+            unique: dict[int, WorkflowRun] = {}
+            for item in raw_runs:
+                if item.get("event") != "schedule":
+                    continue
+                run = WorkflowRun(
+                    run_id=int(item["id"]),
+                    status=str(item["status"]),
+                    conclusion=item.get("conclusion"),
+                )
+                unique[run.run_id] = run
+            return list(unique.values())
+        except (
+            HTTPError,
+            URLError,
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise MonitorError("GitHub Actions history request failed") from error
+
+
 def format_availability(result: PageResult) -> str:
     return (
         "🎟 Появились экскурсии в музее «Собрание»!\n\n"
@@ -160,6 +243,49 @@ def format_unexpected(result: PageResult) -> str:
         "Мониторинг продолжится по расписанию.\n\n"
         f"Фрагмент: {excerpt}\n\n"
         f"Проверить страницу: {PAGE_URL}"
+    )
+
+
+def summarize_runs(runs: Sequence[WorkflowRun], expected: int = 21) -> RunSummary:
+    if expected != 21:
+        raise MonitorError("The report contract requires exactly 21 checks")
+    unique = {run.run_id: run for run in runs}
+    if len(unique) > expected:
+        raise MonitorError("More scheduled monitor runs found than expected")
+    terminal = [
+        run
+        for run in unique.values()
+        if run.status == "completed" and run.conclusion is not None
+    ]
+    successes = sum(run.conclusion == "success" for run in terminal)
+    return RunSummary(
+        successes=successes,
+        errors=expected - successes,
+        terminal_runs=len(terminal),
+        observed_runs=len(unique),
+    )
+
+
+def format_daily_report(summary: RunSummary) -> str:
+    if summary.errors == 0:
+        return "ℹ️ Сегодня до 14:30 МСК экскурсии не появились."
+    if summary.errors < 5:
+        error_text = (
+            "1 проверка завершилась ошибкой"
+            if summary.errors == 1
+            else f"{summary.errors} проверки завершились ошибкой"
+        )
+        return (
+            "ℹ️ В успешных проверках экскурсии не обнаружены.\n"
+            f"{summary.successes} успешных проверок; "
+            f"{error_text}."
+        )
+    percentage = summary.error_ratio * 100
+    return (
+        "⚠️ Надёжно проверить наличие экскурсий не удалось.\n"
+        f"Ошибок: {summary.errors} из 21 ({percentage:.1f}%). "
+        f"Успешных проверок: {summary.successes}.\n"
+        "Мониторинг продолжится по расписанию."
     )
 
 
@@ -205,13 +331,50 @@ def run_check(
     return 2
 
 
+def run_report(
+    github: GitHubClient,
+    telegram: TelegramClient,
+    state_path: Path,
+    now_utc: datetime,
+    final_attempt: bool,
+) -> int:
+    day = _moscow_day(now_utc)
+    state = DailyState.for_date(state_path, day)
+    if state.daily_report_sent:
+        return 0
+    try:
+        runs = github.list_monitor_runs(day, now_utc)
+        summary = summarize_runs(runs)
+    except MonitorError:
+        return 3
+
+    if not final_attempt and (
+        summary.observed_runs < 21 or summary.terminal_runs < 21
+    ):
+        return 4
+
+    if state.alert_sent and summary.errors < 5:
+        state.daily_report_sent = True
+        state.save(state_path)
+        return 0
+
+    try:
+        telegram.send(format_daily_report(summary))
+    except MonitorError:
+        return 3
+    state.daily_report_sent = True
+    state.save(state_path)
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     environ: dict[str, str] | os._Environ[str] = os.environ,
     opener: Callable[..., object] | None = urlopen,
 ) -> int:
     parser = argparse.ArgumentParser(description="Monitor museum tour availability")
-    parser.add_argument("command", choices=("check", "test-notification"))
+    parser.add_argument("command", choices=("check", "report", "test-notification"))
+    parser.add_argument("--final-attempt", choices=("true", "false"), default="false")
     arguments = parser.parse_args(argv)
 
     token = environ.get("TELEGRAM_BOT_TOKEN")
@@ -229,10 +392,25 @@ def main(
             return 3
         return 0
 
+    state_path = Path(environ.get("MONITOR_STATE_PATH", "state/status.json"))
+    if arguments.command == "report":
+        github_token = environ.get("GITHUB_TOKEN")
+        repository = environ.get("GITHUB_REPOSITORY")
+        if not github_token or not repository:
+            print("Missing required GitHub configuration")
+            return 3
+        return run_report(
+            GitHubClient(github_token, repository, opener=opener),
+            telegram,
+            state_path,
+            datetime.now(timezone.utc),
+            final_attempt=arguments.final_attempt == "true",
+        )
+
     return run_check(
         PageClient(opener=opener),
         telegram,
-        Path(environ.get("MONITOR_STATE_PATH", "state/status.json")),
+        state_path,
         datetime.now(timezone.utc),
     )
 

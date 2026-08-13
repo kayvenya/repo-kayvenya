@@ -9,16 +9,21 @@ from urllib.error import URLError
 
 from src.monitor import (
 	DailyState,
+	GitHubClient,
 	PageClient,
 	MonitorError,
 	PageKind,
 	PageResult,
 	TelegramClient,
+	WorkflowRun,
 	classify_tour_page,
+	format_daily_report,
 	format_availability,
 	format_unexpected,
 	main,
 	run_check,
+	run_report,
+	summarize_runs,
 )
 
 
@@ -304,6 +309,187 @@ class CheckFlowTests(unittest.TestCase):
 		self.assertEqual([], self.telegram.messages)
 		self.assertFalse(self.state_path.exists())
 
+
+def _workflow_runs(successes=0, failures=0, in_progress=0):
+	runs = [
+		WorkflowRun(index, "completed", "success") for index in range(successes)
+	]
+	start = len(runs)
+	runs.extend(
+		WorkflowRun(start + index, "completed", "failure")
+		for index in range(failures)
+	)
+	start = len(runs)
+	runs.extend(
+		WorkflowRun(start + index, "in_progress", None)
+		for index in range(in_progress)
+	)
+	return runs
+
+
+class _FakeGitHub:
+	def __init__(self, runs=None, error=None):
+		self.runs = runs or []
+		self.error = error
+
+	def list_monitor_runs(self, day, now_utc):
+		if self.error:
+			raise self.error
+		return self.runs
+
+
+class ReportTests(unittest.TestCase):
+	def setUp(self):
+		self.temp_dir = tempfile.TemporaryDirectory()
+		self.addCleanup(self.temp_dir.cleanup)
+		self.state_path = Path(self.temp_dir.name) / "status.json"
+		self.telegram = _FakeTelegram()
+		self.now = datetime(2026, 8, 14, 11, 40, tzinfo=timezone.utc)
+
+	def test_twenty_one_successes_report_no_tours(self):
+		summary = summarize_runs(_workflow_runs(successes=21))
+		self.assertEqual((21, 0), (summary.successes, summary.errors))
+		self.assertIn("экскурсии не появились", format_daily_report(summary))
+
+	def test_three_errors_report_partial_observation(self):
+		summary = summarize_runs(_workflow_runs(successes=18, failures=3))
+		message = format_daily_report(summary)
+		self.assertIn("18 успешных", message)
+		self.assertIn("3 проверки завершились ошибкой", message)
+
+	def test_one_error_uses_singular_wording(self):
+		message = format_daily_report(
+			summarize_runs(_workflow_runs(successes=20, failures=1))
+		)
+		self.assertIn("1 проверка завершилась ошибкой", message)
+
+	def test_five_errors_report_unreliable_result(self):
+		summary = summarize_runs(_workflow_runs(successes=16, failures=5))
+		self.assertGreaterEqual(summary.error_ratio, 0.20)
+		self.assertIn("Надёжно проверить", format_daily_report(summary))
+
+	def test_missing_and_incomplete_runs_are_errors(self):
+		summary = summarize_runs(_workflow_runs(successes=17, in_progress=1))
+		self.assertEqual(4, summary.errors)
+
+	def test_non_final_attempt_defers_until_all_runs_are_terminal(self):
+		code = run_report(
+			_FakeGitHub(_workflow_runs(successes=20, in_progress=1)),
+			self.telegram,
+			self.state_path,
+			self.now,
+			final_attempt=False,
+		)
+		self.assertEqual(4, code)
+		self.assertEqual([], self.telegram.messages)
+		self.assertFalse(self.state_path.exists())
+
+	def test_final_attempt_counts_missing_runs_and_sends_partial_report(self):
+		code = run_report(
+			_FakeGitHub(_workflow_runs(successes=18)),
+			self.telegram,
+			self.state_path,
+			self.now,
+			final_attempt=True,
+		)
+		self.assertEqual(0, code)
+		self.assertIn("18 успешных", self.telegram.messages[0])
+		self.assertTrue(
+			DailyState.for_date(self.state_path, date(2026, 8, 14)).daily_report_sent
+		)
+
+	def test_availability_suppresses_negative_but_not_high_error_warning(self):
+		state = DailyState(day=date(2026, 8, 14), alert_sent=True)
+		state.save(self.state_path)
+		self.assertEqual(
+			0,
+			run_report(
+				_FakeGitHub(_workflow_runs(successes=18, failures=3)),
+				self.telegram,
+				self.state_path,
+				self.now,
+				final_attempt=True,
+			),
+		)
+		self.assertEqual([], self.telegram.messages)
+
+		state = DailyState.for_date(self.state_path, date(2026, 8, 14))
+		state.daily_report_sent = False
+		state.save(self.state_path)
+		self.assertEqual(
+			0,
+			run_report(
+				_FakeGitHub(_workflow_runs(successes=16, failures=5)),
+				self.telegram,
+				self.state_path,
+				self.now,
+				final_attempt=True,
+			),
+		)
+		self.assertIn("Надёжно проверить", self.telegram.messages[0])
+
+	def test_sent_report_suppresses_retry(self):
+		DailyState(
+			day=date(2026, 8, 14), daily_report_sent=True
+		).save(self.state_path)
+		code = run_report(
+			_FakeGitHub(error=AssertionError("must not query")),
+			self.telegram,
+			self.state_path,
+			self.now,
+			final_attempt=True,
+		)
+		self.assertEqual(0, code)
+		self.assertEqual([], self.telegram.messages)
+
+	def test_telegram_failure_leaves_report_unsent(self):
+		code = run_report(
+			_FakeGitHub(_workflow_runs(successes=21)),
+			_FakeTelegram(MonitorError("Telegram delivery failed")),
+			self.state_path,
+			self.now,
+			final_attempt=True,
+		)
+		self.assertEqual(3, code)
+		self.assertFalse(self.state_path.exists())
+
+	def test_github_client_filters_manual_runs_and_deduplicates_ids(self):
+		requests = []
+		payload = {
+			"workflow_runs": [
+				{
+					"id": 10,
+					"event": "schedule",
+					"status": "completed",
+					"conclusion": "success",
+				},
+				{
+					"id": 10,
+					"event": "schedule",
+					"status": "completed",
+					"conclusion": "success",
+				},
+				{
+					"id": 11,
+					"event": "workflow_dispatch",
+					"status": "completed",
+					"conclusion": "success",
+				},
+			]
+		}
+
+		def opener(request, timeout):
+			requests.append(request)
+			return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+		runs = GitHubClient("github-token", "owner/repo", opener=opener).list_monitor_runs(
+			date(2026, 8, 14), self.now
+		)
+
+		self.assertEqual([WorkflowRun(10, "completed", "success")], runs)
+		self.assertIn("museum-tours-monitor.yml/runs", requests[0].full_url)
+		self.assertIn("event=schedule", requests[0].full_url)
+		self.assertEqual("Bearer github-token", requests[0].get_header("Authorization"))
 
 if __name__ == "__main__":
 	unittest.main()
