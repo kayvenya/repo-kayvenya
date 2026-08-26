@@ -1,7 +1,7 @@
 {
   "date": "2026-08-26",
   "alert_sent": false,
-  "daily_report_sent": false,
+  "daily_report_sent": true,
   "unexpected_hashes": [
     "1d82a155f76afc91eaf56d7bfc42e19438eb5a3abf669ee0bb08e055314e0f1f"
   ]
