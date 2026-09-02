@@ -3,6 +3,7 @@
   "alert_sent": false,
   "daily_report_sent": false,
   "unexpected_hashes": [
-    "aa341161d5b82bd2203a6b2ba3b596d3e0fefd1fab7e6fb865869508be16abcc"
+    "aa341161d5b82bd2203a6b2ba3b596d3e0fefd1fab7e6fb865869508be16abcc",
+    "ec4fc3b48bae007aa440cf8a2cf4719a896bc92c2f220bc279a88324434f66b1"
   ]
 }
