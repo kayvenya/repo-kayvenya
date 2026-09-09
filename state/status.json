@@ -1,7 +1,7 @@
 {
   "date": "2026-09-09",
   "alert_sent": false,
-  "daily_report_sent": false,
+  "daily_report_sent": true,
   "unexpected_hashes": [
     "6132d88c5adabfcdba112cc7a9a97047ac47ebed08877eb95a58fd7e0d6d4d90",
     "c872baa901e848efd64edb62c742fa9b974bccf039c0d9bd75bfd01ce76ef78d"
