@@ -1,6 +1,8 @@
 {
-  "date": "2026-10-11",
+  "date": "2026-10-12",
   "alert_sent": false,
-  "daily_report_sent": true,
-  "unexpected_hashes": []
+  "daily_report_sent": false,
+  "unexpected_hashes": [
+    "ddfb455926aa7e13083c7d927b8557205b8e7bb15c6bd104a36e29deb5afd523"
+  ]
 }
