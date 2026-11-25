@@ -2,5 +2,7 @@
   "date": "2026-11-25",
   "alert_sent": false,
   "daily_report_sent": true,
-  "unexpected_hashes": []
+  "unexpected_hashes": [
+    "2c675a2a79b9b11cf7481e07ca6c3e918f5e6aaccf15aa097864e742b0e017ed"
+  ]
 }
